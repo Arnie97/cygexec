@@ -1,13 +1,25 @@
 /*
-  FUSE: Filesystem in Userspace
+  CygExec: Cygwin-style magic executable bits for FUSE
+
   Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
   Copyright (C) 2011       Sebastian Pipping <sebastian@pipping.org>
-  This program can be distributed under the terms of the GNU GPL.
-  See the file COPYING.
-  gcc -Wall fusexmp_fh.c `pkg-config fuse --cflags --libs` -lulockmgr -o fusexmp_fh
+  Copyright (C) 2019       Arnie97 <arnie97@gmail.com>
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-#define FUSE_USE_VERSION 26
+#define FUSE_USE_VERSION 29
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
@@ -31,35 +43,61 @@
 #endif
 #include <sys/file.h> /* flock(2) */
 
-static int xmp_getattr(const char *path, struct stat *stbuf)
+#define S(char_array) {sizeof(char_array) - 1, (char_array)}
+static const struct str {
+    size_t len;
+    const char *buf;
+} exec_magic[] = {
+    S("\x7F" "ELF"),        /* Execute and Link Format */
+    S("#!"),                /* Shebang line */
+    S("MZ"),                /* DOS Executable / Windows PE */
+    S("\xFE\xED\xFA\xCE"),  /* Mach-O 32-bit */
+    S("\xCE\xFA\xED\xFE"),  /* Mach-O 32-bit swapped */
+    S("\xFE\xED\xFA\xCF"),  /* Mach-O 64-bit */
+    S("\xCF\xFA\xED\xFE"),  /* Mach-O 64-bit swapped */
+};
+
+static int is_executable(const char *path)
 {
-    int res;
+    int fd = open(path, O_RDONLY);
+    if (fd == -1)
+        return 0;
 
-    res = lstat(path, stbuf);
-    if (res == -1)
-        return -errno;
+    char buf[exec_magic->len + 1];
+    buf[exec_magic->len] = 0;
+    int res = pread(fd, buf, exec_magic->len, 0);
+    close(fd);
 
+    size_t i = sizeof exec_magic / sizeof *exec_magic;
+    if (res != -1)
+        while (i--)
+            if (memcmp(buf, exec_magic[i].buf, exec_magic[i].len) == 0)
+                return 1;
     return 0;
 }
 
 static int xmp_fgetattr(const char *path, struct stat *stbuf,
             struct fuse_file_info *fi)
 {
-    int res;
-
-    (void) path;
-
-    res = fstat(fi->fh, stbuf);
+    int res = fi? fstat(fi->fh, stbuf): lstat(path, stbuf);
     if (res == -1)
         return -errno;
-
+    if (is_executable(path))
+        stbuf->st_mode |= S_IXUSR | S_IXGRP | S_IXOTH;
     return 0;
+}
+
+static int xmp_getattr(const char *path, struct stat *stbuf)
+{
+    return xmp_fgetattr(path, stbuf, NULL);
 }
 
 static int xmp_access(const char *path, int mask)
 {
     int res;
 
+    if (mask & X_OK && is_executable(path))
+        mask &= ~X_OK;
     res = access(path, mask);
     if (res == -1)
         return -errno;
@@ -105,7 +143,7 @@ static int xmp_opendir(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
-static inline struct xmp_dirp *get_dirp(struct fuse_file_info *fi)
+static struct xmp_dirp *get_dirp(struct fuse_file_info *fi)
 {
     return (struct xmp_dirp *) (uintptr_t) fi->fh;
 }
@@ -560,6 +598,10 @@ static struct fuse_operations xmp_oper = {
 
 int main(int argc, char *argv[])
 {
+    if ((getuid() == 0) || (geteuid() == 0)) {
+        fputs("Do not run FUSE in privileged mode!", stderr);
+        return 1;
+    }
     umask(0);
     return fuse_main(argc, argv, &xmp_oper, NULL);
 }
